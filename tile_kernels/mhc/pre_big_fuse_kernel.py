@@ -4,14 +4,22 @@ import tilelang
 import torch
 from tilelang import language as T
 
+_IS_HIP = torch.version.hip is not None
 
-@tilelang.jit(
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
-        tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
-    },
-)
+_PASS_CONFIGS = {
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
+}
+if not _IS_HIP:
+    _PASS_CONFIGS[tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL] = 10
+
+# MI300 wavefront=64, NVIDIA warp=32
+_THREADS = 128 if _IS_HIP else 96
+_SPLIT_POINT = 64 if _IS_HIP else 32
+_NUM_STAGES = 1 if _IS_HIP else 2
+
+
+@tilelang.jit(pass_configs=_PASS_CONFIGS)
 def _mhc_pre_big_fuse(
     hidden_size: int,
     rms_eps: float,
@@ -38,11 +46,11 @@ def _mhc_pre_big_fuse(
         comb_mix: T.Tensor[(num_tokens, mhc_mult * mhc_mult), T.float32],
         layer_input: T.Tensor[(num_tokens, hidden_size), T.bfloat16],
     ) -> None:
-        with T.Kernel(num_tokens, threads=96) as pid:
+        with T.Kernel(num_tokens, threads=_THREADS) as pid:
             ##################################################################
             # _mhc_pre_norm_fn_fwd_norm
             mixes_shared = T.alloc_shared(mhc_mult3, T.float32)
-            if T.get_thread_binding() < 32:
+            if T.get_thread_binding() < _SPLIT_POINT:
                 rms = T.alloc_fragment(1, T.float32)
                 mixes = T.alloc_fragment(mhc_mult3, T.float32)
                 T.clear(mixes)
@@ -57,7 +65,7 @@ def _mhc_pre_big_fuse(
                     mixes[j] *= rms[0]
                 T.copy(mixes, mixes_shared, disable_tma=True)
 
-            if T.get_thread_binding() < 32:
+            if T.get_thread_binding() < _SPLIT_POINT:
                 ##################################################################
                 # _mhc_pre_split_mixes_fwd (post & comb)
                 cm = T.alloc_fragment((mhc_mult, mhc_mult), T.float32)
@@ -112,7 +120,7 @@ def _mhc_pre_big_fuse(
                     )
                 ###################################################################
                 # _mhc_pre_apply_mix_fwd
-                for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
+                for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=_NUM_STAGES):
                     xs = T.alloc_shared((mhc_mult, hidden_block), T.bfloat16)
                     xl = T.alloc_fragment((mhc_mult, hidden_block), T.float32)
                     T.copy(residual[pid, 0, i0_h * hidden_block], xs, disable_tma=True)

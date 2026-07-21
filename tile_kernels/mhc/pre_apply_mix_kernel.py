@@ -4,19 +4,30 @@ import tilelang
 import torch
 from tilelang import language as T
 
+_IS_HIP = torch.version.hip is not None
+
 _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
     tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
 }
 
+# Tuned defaults per platform
+if _IS_HIP:
+    _FWD_DEFAULTS = {'n_thr': 256, 'h_blk': 512, 'num_stages': 2}
+    _BWD_DEFAULTS = {'n_thr': 256, 'h_blk': 512, 'num_stages': 2}
+else:
+    _FWD_DEFAULTS = {'n_thr': 128, 'h_blk': 1024, 'num_stages': 2}
+    _BWD_DEFAULTS = {'n_thr': 128, 'h_blk': 1024, 'num_stages': 2}
+
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
 def _mhc_pre_apply_mix_fwd(
     mhc_mult: int,
     hidden: int,
-    n_thr: int = 128,
-    h_blk: int = 1024,
+    n_thr: int = _FWD_DEFAULTS['n_thr'],
+    h_blk: int = _FWD_DEFAULTS['h_blk'],
+    num_stages: int = _FWD_DEFAULTS['num_stages'],
 ) -> tilelang.JITKernel:
     n = T.dynamic('n')
     h = hidden
@@ -34,7 +45,7 @@ def _mhc_pre_apply_mix_fwd(
             mixl = T.alloc_fragment(mhc, T.float32)
             T.copy(mix[pid_n, 0], mixl)
 
-            for i0_h in T.Pipelined(h // h_blk, num_stages=2):
+            for i0_h in T.Pipelined(h // h_blk, num_stages=num_stages):
                 xs = T.alloc_shared((mhc, h_blk), T.bfloat16)
                 xl = T.alloc_fragment((mhc, h_blk), T.float32)
                 T.copy(x[pid_n, 0, i0_h * h_blk], xs, disable_tma=True)
@@ -58,8 +69,9 @@ def _mhc_pre_apply_mix_fwd(
 def _mhc_pre_apply_mix_bwd(
     mhc_mult: int,
     hidden: int,
-    n_thr: int = 128,
-    h_blk: int = 1024,
+    n_thr: int = _BWD_DEFAULTS['n_thr'],
+    h_blk: int = _BWD_DEFAULTS['h_blk'],
+    num_stages: int = _BWD_DEFAULTS['num_stages'],
 ) -> tilelang.JITKernel:
     n = T.dynamic('n')
     h = hidden
@@ -82,7 +94,7 @@ def _mhc_pre_apply_mix_bwd(
             mgl = T.alloc_reducer(mhc, T.float32, replication='all')
             T.fill(mgl, 0)
 
-            for i0_h in T.Pipelined(h // h_blk, num_stages=2):
+            for i0_h in T.Pipelined(h // h_blk, num_stages=num_stages):
                 ogs = T.alloc_shared(h_blk, T.bfloat16)
                 ogl = T.alloc_fragment(h_blk, T.float32)
                 T.copy(o_grad[pid_n, i0_h * h_blk], ogs, disable_tma=True)

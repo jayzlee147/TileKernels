@@ -4,12 +4,14 @@ import tilelang
 import torch
 from tilelang import language as T
 
+_IS_HIP = torch.version.hip is not None
 
 _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
     tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
 }
+if not _IS_HIP:
+    _PASS_CONFIGS[tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL] = 10
 
 
 def _make_ptr_tables_batched(

@@ -4,15 +4,31 @@ import tilelang
 import torch
 from tilelang import language as T
 
+_IS_HIP = torch.version.hip is not None
 
-@tilelang.jit(
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
-        tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
-    },
-)
-def _mhc_post_fwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024) -> tilelang.JITKernel:
+_PASS_CONFIGS = {
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+    tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
+}
+
+# Tuned defaults per platform (mhc=4, hidden=4096)
+if _IS_HIP:
+    _FWD_DEFAULTS = {'n_thr': 256, 'h_blk': 512, 'num_stages': 3}
+    _BWD_DEFAULTS = {'n_thr': 256, 'h_blk': 512, 'num_stages': 2}
+else:
+    _FWD_DEFAULTS = {'n_thr': 128, 'h_blk': 1024, 'num_stages': 2}
+    _BWD_DEFAULTS = {'n_thr': 128, 'h_blk': 256, 'num_stages': 3}
+
+
+@tilelang.jit(pass_configs=_PASS_CONFIGS)
+def _mhc_post_fwd(
+    mhc: int,
+    hidden: int,
+    n_thr: int = _FWD_DEFAULTS['n_thr'],
+    h_blk: int = _FWD_DEFAULTS['h_blk'],
+    num_stages: int = _FWD_DEFAULTS['num_stages'],
+) -> tilelang.JITKernel:
     n = T.dynamic('num_tokens')
     h = hidden
 
@@ -39,9 +55,10 @@ def _mhc_post_fwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024) ->
             c_local = T.alloc_fragment(mhc, T.float32)
             T.copy(a[pid_n, 0, 0], a_local)
             T.copy(c[pid_n, 0], c_local)
-            T.pdl_sync()
+            if not _IS_HIP:
+                T.pdl_sync()
 
-            for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=2):
+            for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=num_stages):
                 T.copy(b[pid_n, 0, i0_h * h_blk], b_shared, disable_tma=True)
                 T.copy(d[pid_n, i0_h * h_blk], d_shared, disable_tma=True)
 
@@ -59,14 +76,16 @@ def _mhc_post_fwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024) ->
 
 
 @tilelang.jit(
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
-        tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
-    },
+    pass_configs=_PASS_CONFIGS,
     out_idx=[5, 6, 7, 8],
 )
-def _mhc_post_bwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 256) -> tilelang.JITKernel:
+def _mhc_post_bwd(
+    mhc: int,
+    hidden: int,
+    n_thr: int = _BWD_DEFAULTS['n_thr'],
+    h_blk: int = _BWD_DEFAULTS['h_blk'],
+    num_stages: int = _BWD_DEFAULTS['num_stages'],
+) -> tilelang.JITKernel:
     assert mhc == 4
     n = T.dynamic('num_tokens')
     h = hidden
@@ -108,7 +127,7 @@ def _mhc_post_bwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 256) -> 
             T.clear(da_reducer)
             T.clear(dc_reducer)
 
-            for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=3):
+            for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=num_stages):
                 T.copy(dx[pid_n, 0, i0_h * h_blk], dx_shared, disable_tma=True)
                 T.copy(b[pid_n, 0, i0_h * h_blk], b_shared, disable_tma=True)
                 T.copy(d[pid_n, i0_h * h_blk], d_shared, disable_tma=True)

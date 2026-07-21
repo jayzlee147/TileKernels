@@ -2,6 +2,10 @@ import tilelang
 import torch
 from tilelang import language as T
 
+_IS_HIP = torch.version.hip is not None
+_WARP_SIZE = 64 if _IS_HIP else 32
+_DEFAULT_NUM_SMS = 304 if _IS_HIP else 148
+
 _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
 }
@@ -41,7 +45,7 @@ def _mhc_pre_split_mixes_fwd(
                 {
                     input_mixes_frag: T.Fragment(
                         (token_block_size, mhc_mult3),
-                        lambda i, j: (i % 32, i // 32 * mhc_mult3 + j),
+                        lambda i, j: (i % _WARP_SIZE, i // _WARP_SIZE * mhc_mult3 + j),
                     ),
                 },
             )
@@ -72,7 +76,7 @@ def _mhc_pre_split_mixes_bwd(
     mhc_mult: int,
     mhc_post_mult_value: float,
     token_block_size: int,
-    num_sms: int = 148,
+    num_sms: int = _DEFAULT_NUM_SMS,
     dtype: T.dtype = T.float32,
 ) -> tilelang.JITKernel:
     num_tokens = T.dynamic('num_tokens')
@@ -111,7 +115,7 @@ def _mhc_pre_split_mixes_bwd(
                 {
                     input_mixes_grad_frag: T.Fragment(
                         (token_block_size, mhc_mult3),
-                        lambda i, j: (i % 32, i // 32 * mhc_mult3 + j),
+                        lambda i, j: (i % _WARP_SIZE, i // _WARP_SIZE * mhc_mult3 + j),
                     ),
                 },
             )

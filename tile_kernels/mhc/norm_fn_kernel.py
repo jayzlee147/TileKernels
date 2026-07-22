@@ -214,7 +214,7 @@ def _mhc_pre_norm_fn_bwd_mul(
     mhc_mult3: int,
     n_rms_group: int,
     rms_group_size: int,
-    token_block: int = 128,
+    token_block: int = 64 if _IS_HIP else 128,
     hidden_block: int = 128,
 ) -> tilelang.JITKernel:
     assert mhc_mult3 <= 32

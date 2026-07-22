@@ -1,14 +1,4 @@
-"""MI300 validation for norm_fn_kernel.py after adaptation.
-
-Only tests the 4 kernels that compile on ROCm/HIP:
-  - _mhc_fn_normw_merge_fwd
-  - _mhc_fn_normw_merge_bwd
-  - _mhc_pre_norm_fn_fwd_norm
-  - _mhc_pre_norm_fn_bwd_norm
-
-The GEMM-based kernels (_mhc_pre_norm_fn_fwd_mul, _mhc_pre_norm_fn_bwd_mul)
-are skipped due to a tilelang ROCm GEMM lowering bug.
-"""
+"""MI300 validation for norm_fn_kernel.py after adaptation."""
 import importlib.util
 import os
 
@@ -27,6 +17,8 @@ _mhc_fn_normw_merge_fwd = norm_fn_kernel._mhc_fn_normw_merge_fwd
 _mhc_fn_normw_merge_bwd = norm_fn_kernel._mhc_fn_normw_merge_bwd
 _mhc_pre_norm_fn_fwd_norm = norm_fn_kernel._mhc_pre_norm_fn_fwd_norm
 _mhc_pre_norm_fn_bwd_norm = norm_fn_kernel._mhc_pre_norm_fn_bwd_norm
+_mhc_pre_norm_fn_fwd_mul = norm_fn_kernel._mhc_pre_norm_fn_fwd_mul
+_mhc_pre_norm_fn_bwd_mul = norm_fn_kernel._mhc_pre_norm_fn_bwd_mul
 
 
 # ---------------------------------------------------------------------------
@@ -190,11 +182,33 @@ if __name__ == '__main__':
         print(f'  N={num_tokens:5d}: {"PASS" if ok else "FAIL"}')
 
     # --- SKIPPED kernels ---
-    print('\n=== SKIPPED: _mhc_pre_norm_fn_fwd_mul ===')
-    print('  SKIP: tilelang ROCm GEMM lowering not supported (T.annotate_layout + make_swizzled_layout)')
+    print('\n=== pre_norm_fn_fwd_mul smoke ===')
+    for n_rms in [1, 4]:
+        rgs = 1024
+        try:
+            fwd_mul_k = _mhc_pre_norm_fn_fwd_mul(24, n_rms, rgs)
+            N_t = 64
+            x_t = torch.randn(N_t, n_rms * rgs, dtype=torch.bfloat16, device='cuda')
+            fn_t2 = torch.randn(24, n_rms * rgs, dtype=torch.float32, device='cuda')
+            out_t = torch.empty(N_t, n_rms, 24, dtype=torch.float32, device='cuda')
+            sq_t = torch.empty(N_t, n_rms, dtype=torch.float32, device='cuda')
+            fwd_mul_k(x_t, fn_t2, out_t, sq_t)
+            torch.cuda.synchronize()
+            ok = not out_t.isnan().any().item() and not sq_t.isnan().any().item()
+            print(f'  n_rms={n_rms}: {"PASS" if ok else "FAIL"}')
+            all_pass &= ok
+        except Exception as e:
+            print(f'  n_rms={n_rms}: ERROR ({str(e)[:100]})')
+            all_pass = False
 
-    print('\n=== SKIPPED: _mhc_pre_norm_fn_bwd_mul ===')
-    print('  SKIP: tilelang ROCm GEMM lowering not supported (T.annotate_layout + make_swizzled_layout)')
+    print('\n=== pre_norm_fn_bwd_mul smoke ===')
+    try:
+        bwd_mul_k = _mhc_pre_norm_fn_bwd_mul(24, 4, 1024)
+        print('  compile: PASS')
+        all_pass &= True
+    except Exception as e:
+        print(f'  compile: ERROR ({str(e)[:100]})')
+        all_pass = False
 
     # --- Performance ---
     print('\n=== Performance ===')

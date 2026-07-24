@@ -1,4 +1,4 @@
-"""Triton-fused mhc_pre_norm_fn FWD for TileKernels.
+"""Triton-fused mhc_pre_norm_fn FWD + BWD for TileKernels.
 
 Math (FWD):
     For each token (row of residual) of length total_hidden = n_rms_group * rms_group_size:
@@ -12,10 +12,17 @@ Math (FWD):
 
     If mhc_norm_weight is provided, fn is pre-multiplied: fn = fn * weight.
 
+Math (BWD):
+    Given d_out[n, k], for each group g:
+      c_g = sum_k(d_out[k] * dot_g[k])
+      d_x_g[h] = inv_rms_g * (sum_k(d_out[k] * fn[k, g*S+h]) - x_g[h] * inv_rms_g^2 * c_g / S)
+      d_fn[k, g*S+h] = d_out[k] * x_g[h] * inv_rms_g
+
+    inv_rms and dot are recomputed in the BWD kernel to save memory.
+    d_fn cross-token reduction is done on the host via torch.einsum.
+
 This is a fused RMSNorm + small GEMM, replacing the tilelang multi-kernel
 approach (normw_merge, fwd_mul, fwd_norm) with a single Triton kernel.
-
-BWD: TODO
 """
 
 from __future__ import annotations
@@ -161,6 +168,91 @@ def _norm_fn_fwd_kernel_vec(
 
 
 # ---------------------------------------------------------------------------
+# BWD kernel – computes d_x (d_fn is computed on the host)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _norm_fn_bwd_kernel(
+    # Inputs
+    DOUT_PTR,    # [num_tokens, mhc_mult3]   fp32, contiguous
+    X_PTR,       # [num_tokens, total_hidden] bf16, contiguous
+    FN_PTR,      # [mhc_mult3, total_hidden]  fp32, contiguous
+    # Output
+    DX_PTR,      # [num_tokens, total_hidden] fp32, contiguous
+    # Dimensions
+    num_tokens,
+    total_hidden,
+    MHC_MULT3: tl.constexpr,
+    RMS_GROUP_SIZE: tl.constexpr,
+    N_RMS_GROUP: tl.constexpr,
+    H_BLK: tl.constexpr,
+    K_BLK: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """Each program handles one (token, group) pair.
+
+    Recomputes inv_rms and dot from x and fn, then uses d_out to produce d_x.
+    """
+    pid_n = tl.program_id(0)   # token index
+    pid_g = tl.program_id(1)   # group index
+
+    k_offs = tl.arange(0, K_BLK)  # [K_BLK]
+    k_mask = k_offs < MHC_MULT3
+
+    x_row_base = pid_n * total_hidden
+    group_base = pid_g * RMS_GROUP_SIZE
+
+    # Load d_out[pid_n, :] — shape [K_BLK]
+    dout_base = pid_n * MHC_MULT3
+    d_out = tl.load(DOUT_PTR + dout_base + k_offs, mask=k_mask, other=0.0)  # [K_BLK]
+
+    # --- Pass 1: recompute sqrsum and dot_acc for this group ---
+    sqrsum = tl.zeros([], dtype=tl.float32)
+    dot_acc = tl.zeros([K_BLK], dtype=tl.float32)
+
+    for h_start in tl.static_range(0, RMS_GROUP_SIZE, H_BLK):
+        h_offs = h_start + tl.arange(0, H_BLK)  # [H_BLK]
+
+        x_addrs = x_row_base + group_base + h_offs
+        x_vals = tl.load(X_PTR + x_addrs).to(tl.float32)  # [H_BLK]
+
+        sqrsum += tl.sum(x_vals * x_vals)
+
+        fn_addrs = k_offs[:, None] * total_hidden + (group_base + h_offs)[None, :]  # [K_BLK, H_BLK]
+        fn_vals = tl.load(FN_PTR + fn_addrs, mask=k_mask[:, None], other=0.0)  # [K_BLK, H_BLK]
+        dot_acc += tl.sum(fn_vals * x_vals[None, :], axis=1)  # [K_BLK]
+
+    inv_rms = tl.rsqrt(sqrsum / RMS_GROUP_SIZE + EPS)
+
+    # c_g = sum_k(d_out[k] * dot_acc[k]) — scalar
+    c_g = tl.sum(d_out * dot_acc)
+
+    # Precompute coefficient for the rms-gradient term
+    # coeff = -inv_rms^3 / S * c_g  =  inv_rms * (-inv_rms^2 * c_g / S)
+    rms_coeff = -inv_rms * inv_rms * inv_rms * c_g / RMS_GROUP_SIZE
+
+    # --- Pass 2: compute d_x for each h ---
+    for h_start in tl.static_range(0, RMS_GROUP_SIZE, H_BLK):
+        h_offs = h_start + tl.arange(0, H_BLK)  # [H_BLK]
+
+        x_addrs = x_row_base + group_base + h_offs
+        x_vals = tl.load(X_PTR + x_addrs).to(tl.float32)  # [H_BLK]
+
+        # sum_k(d_out[k] * fn[k, group_base + h]) for each h
+        fn_addrs = k_offs[:, None] * total_hidden + (group_base + h_offs)[None, :]  # [K_BLK, H_BLK]
+        fn_vals = tl.load(FN_PTR + fn_addrs, mask=k_mask[:, None], other=0.0)  # [K_BLK, H_BLK]
+        # dout_fn[h] = sum_k(d_out[k] * fn[k, h])
+        dout_fn = tl.sum(d_out[:, None] * fn_vals, axis=0)  # [H_BLK]
+
+        # d_x[h] = inv_rms * dout_fn[h] + rms_coeff * x[h]
+        dx_vals = inv_rms * dout_fn + rms_coeff * x_vals  # [H_BLK]
+
+        dx_addrs = pid_n * total_hidden + group_base + h_offs
+        tl.store(DX_PTR + dx_addrs, dx_vals)
+
+
+# ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
 
@@ -209,8 +301,61 @@ def norm_fn_fwd_triton(
     return out
 
 
+def norm_fn_bwd_triton(
+    d_out: torch.Tensor,        # [num_tokens, mhc_mult3]    fp32
+    x: torch.Tensor,            # [num_tokens, total_hidden] bf16, contiguous
+    fn: torch.Tensor,           # [mhc_mult3, total_hidden]  fp32, contiguous
+    mhc_mult3: int,
+    n_rms_group: int,
+    rms_group_size: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch the BWD Triton kernel for d_x and compute d_fn on host.
+
+    Returns:
+        d_x:  [num_tokens, total_hidden] fp32
+        d_fn: [mhc_mult3, total_hidden]  fp32
+    """
+    num_tokens = x.shape[0]
+    total_hidden = x.shape[1]
+
+    d_x = torch.empty((num_tokens, total_hidden), dtype=torch.float32, device=x.device)
+
+    H_BLK = _pick_h_blk(rms_group_size)
+    K_BLK = _next_power_of_2(mhc_mult3)
+
+    grid = (num_tokens, n_rms_group)
+
+    _norm_fn_bwd_kernel[grid](
+        d_out, x, fn,
+        d_x,
+        num_tokens, total_hidden,
+        MHC_MULT3=mhc_mult3,
+        RMS_GROUP_SIZE=rms_group_size,
+        N_RMS_GROUP=n_rms_group,
+        H_BLK=H_BLK,
+        K_BLK=K_BLK,
+        EPS=eps,
+    )
+
+    # d_fn[k, h] = sum_n(d_out[n, k] * x_normed[n, h])
+    # where x_normed[n, h] = x[n, h] * inv_rms[n, g(h)] and g(h) = h // rms_group_size
+    # Recompute x_normed on the host to avoid storing it
+    x_f = x.float()  # [num_tokens, total_hidden]
+    # Compute per-group inv_rms: [num_tokens, n_rms_group]
+    x_grouped = x_f.view(num_tokens, n_rms_group, rms_group_size)
+    sqrsum = (x_grouped * x_grouped).sum(-1)  # [num_tokens, n_rms_group]
+    inv_rms = torch.rsqrt(sqrsum / rms_group_size + eps)  # [num_tokens, n_rms_group]
+    # x_normed[n, g, h] = x[n, g, h] * inv_rms[n, g]
+    x_normed = (x_grouped * inv_rms.unsqueeze(-1)).view(num_tokens, total_hidden)
+    # d_fn = d_out^T @ x_normed: [mhc_mult3, total_hidden]
+    d_fn = d_out.t() @ x_normed
+
+    return d_x, d_fn
+
+
 # ---------------------------------------------------------------------------
-# Autograd wrapper (FWD only; BWD = TODO)
+# Autograd wrapper
 # ---------------------------------------------------------------------------
 
 
@@ -243,85 +388,6 @@ class MhcPreNormFnTritonFn(torch.autograd.Function):
         x = residual.flatten(2, 3).contiguous()
         assert x.shape[-1] == total_hidden
 
-        # Determine n_rms_group and rms_group_size from shapes
-        # mhc_fn is (mhc_mult3, n_rms_group * rms_group_size)
-        # The original ref reshapes residual to (-1, 1, rms_group_size)
-        # and fn to (mhc_mult, 1, rms_group_size).
-        # Here mhc_mult = mhc_fn.shape[0] = mhc_mult3 and rms_group_size = mhc_fn.shape[-1]
-        # Wait, re-read the ref:
-        #   mhc_mult = mhc_fn.shape[0]   => this is mhc_mult3 in the tilelang version
-        #   rms_group_size = mhc_fn.shape[-1]  => fn shape is (mhc_mult3, rms_group_size)??
-        # Actually no. In the ref:
-        #   mhc_fn shape is (mhc_mult3, n_rms_group, rms_group_size) originally,
-        #   then .flatten(1,2) -> (mhc_mult3, total_hidden)
-        #   In the ref code: mhc_mult = mhc_fn.shape[0], rms_group_size = mhc_fn.shape[-1]
-        #   This means mhc_fn has at least 2 dims. Looking at mhc_fn.shape[-1] => rms_group_size.
-        #   But mhc_fn is already (mhc_mult3, total_hidden) after flatten...
-        #
-        # Let me re-read the ref:
-        #   mhc_mult = mhc_fn.shape[0]      # = mhc_mult3
-        #   rms_group_size = mhc_fn.shape[-1]  # This works if fn is (mhc_mult3, rms_group_size)
-        #                                       # but fn is (mhc_mult3, n_rms_group*rms_group_size)
-        #
-        # The ref passes fn as (mhc_mult3, n_rms_group, rms_group_size) NOT flattened.
-        # The test flatten it: fn.flatten(1,2). But the ref expects non-flattened fn.
-        #
-        # So actually: in the ref, mhc_fn.shape = (mhc_mult3, n_rms_group, rms_group_size)
-        # but in the test, fn is created as (mhc_mult3, mhc_mult, hidden_size).flatten(1,2)
-        # = (mhc_mult3, mhc_mult*hidden_size) = (mhc_mult3, total_hidden)
-        # Then in the ref: rms_group_size = mhc_fn.shape[-1] = total_hidden??
-        #
-        # That can't be right. Let me re-read more carefully.
-        # In test_norm_fn.py, fn is passed directly to mhc_pre_norm_fn_ref as
-        # (mhc_mult3, total_hidden) where total_hidden = mhc_mult * hidden_size.
-        # In the ref: rms_group_size = mhc_fn.shape[-1] = total_hidden.
-        # Then residual.view(-1, 1, rms_group_size) => each row IS one group.
-        # And n_rms_group = total_hidden / rms_group_size = 1??
-        #
-        # Wait, but the tilelang kernel has n_rms_group as a parameter and it's 4.
-        # Let me look at how the tilelang ops call it.
-
-        # We need to figure out the actual intended n_rms_group.
-        # The safest approach: accept it as a parameter from the caller.
-        # For now, infer from shapes. If mhc_fn is 2D (mhc_mult3, total_hidden),
-        # then rms_group_size = total_hidden and n_rms_group = 1 (as the ref does).
-        # If mhc_fn is 3D (mhc_mult3, n_rms_group, rms_group_size), use those dims.
-
-        # Based on the ref code: rms_group_size = mhc_fn.shape[-1], and the fn
-        # is used as-is. So if fn is 2D, rms_group_size = fn.shape[-1] = total_hidden,
-        # and there's only 1 group. If fn is 3D, rms_group_size = fn.shape[-1].
-        # For our Triton wrapper, we use the ORIGINAL fn shape before flatten.
-        # But we receive it already flattened... So we need rms_group_size as a param.
-
-        # Actually, re-reading the ref more carefully:
-        #   residual is (n0, n1, mhc*hidden) after flatten(2,3).float()
-        #   mhc_mult = mhc_fn.shape[0]
-        #   rms_group_size = mhc_fn.shape[-1]
-        #   residual.view(-1, 1, rms_group_size) => (n0*n1 * n_rms_group, 1, rms_group_size)
-        #     where n_rms_group = total_hidden / rms_group_size
-        #   mhc_fn.view(mhc_mult, 1, rms_group_size) => fn must be (mhc_mult, total_hidden)
-        #     and view as (mhc_mult, 1, rms_group_size) => this only works if total_hidden == rms_group_size
-        #
-        # Hmm, that means fn.view(mhc_mult, 1, rms_group_size) requires total_hidden = rms_group_size.
-        # So in the ref, fn.shape[-1] IS rms_group_size, and the view(-1,1,rms_group_size)
-        # splits residual into chunks, each of size rms_group_size.
-        # n_rms_group = total_hidden / rms_group_size.
-        #
-        # Wait, fn.view(mhc_mult, 1, rms_group_size) — this doesn't change the data,
-        # just adds a middle dim of 1. The fn shape is (mhc_mult, rms_group_size) before this.
-        # But fn was created as (mhc_mult3, mhc_mult * hidden_size) in the test.
-        # So rms_group_size = mhc_mult * hidden_size = total_hidden.
-        #
-        # Then residual.view(-1, 1, rms_group_size) = (n0*n1, 1, total_hidden).
-        # That means there IS only 1 group in the ref.
-        #
-        # But the tilelang kernel has n_rms_group = 4. So the tilelang version
-        # must receive fn in a different shape. Let me check the modeling/mhc/ops.py.
-
-        # For this Triton implementation, let's follow the REF exactly:
-        # rms_group_size = fn.shape[-1] (= total_hidden if fn is 2D)
-        # n_rms_group = total_hidden // rms_group_size
-
         rms_group_size = fn.shape[-1]
         n_rms_group = total_hidden // rms_group_size
         assert n_rms_group * rms_group_size == total_hidden
@@ -339,15 +405,53 @@ class MhcPreNormFnTritonFn(torch.autograd.Function):
         # Reshape output: (N, mhc_mult3) -> (n0, n1, mhc_mult3)
         out = out.view(n0, n1, mhc_mult3)
 
-        # TODO: save tensors for backward
-        # ctx.save_for_backward(...)
+        # Save for backward (save_for_backward accepts None entries)
+        ctx.save_for_backward(x_flat, fn, mhc_fn, mhc_norm_weight)
+        ctx.n0 = n0
+        ctx.n1 = n1
+        ctx.mhc_mult3 = mhc_mult3
+        ctx.n_rms_group = n_rms_group
+        ctx.rms_group_size = rms_group_size
+        ctx.mhc_norm_eps = mhc_norm_eps
+        ctx.residual_shape = residual.shape
 
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        # TODO: implement backward pass
-        raise NotImplementedError('norm_fn_triton backward not yet implemented')
+        x_flat, fn, mhc_fn, mhc_norm_weight = ctx.saved_tensors
+        n0, n1 = ctx.n0, ctx.n1
+        mhc_mult3 = ctx.mhc_mult3
+        n_rms_group = ctx.n_rms_group
+        rms_group_size = ctx.rms_group_size
+        eps = ctx.mhc_norm_eps
+
+        # grad_output: (n0, n1, mhc_mult3) -> flatten to (N, mhc_mult3)
+        d_out = grad_output.reshape(n0 * n1, mhc_mult3).contiguous()
+
+        d_x_flat, d_fn = norm_fn_bwd_triton(
+            d_out, x_flat, fn,
+            mhc_mult3=mhc_mult3,
+            n_rms_group=n_rms_group,
+            rms_group_size=rms_group_size,
+            eps=eps,
+        )
+
+        # d_x_flat: (N, total_hidden) fp32 -> reshape to original residual shape
+        d_residual = d_x_flat.view(ctx.residual_shape).to(x_flat.dtype)
+
+        # d_fn is w.r.t. the (possibly weight-merged) fn.
+        # If mhc_norm_weight was applied: fn = mhc_fn * weight
+        #   d_mhc_fn = d_fn * weight
+        #   d_weight  = (d_fn * mhc_fn).sum(0)
+        if mhc_norm_weight is not None:
+            d_mhc_fn = d_fn * mhc_norm_weight
+            d_norm_weight = (d_fn * mhc_fn).sum(0)
+        else:
+            d_mhc_fn = d_fn
+            d_norm_weight = None
+
+        return d_residual, d_mhc_fn, d_norm_weight, None  # None for mhc_norm_eps
 
 
 def mhc_pre_norm_fn_triton(
@@ -356,7 +460,7 @@ def mhc_pre_norm_fn_triton(
     mhc_norm_weight: torch.Tensor | None,
     mhc_norm_eps: float,
 ) -> torch.Tensor:
-    """Triton-fused mhc_pre_norm_fn (drop-in replacement for mhc_pre_norm_fn_ref, FWD only).
+    """Triton-fused mhc_pre_norm_fn (drop-in replacement for mhc_pre_norm_fn_ref).
 
     Args:
         residual:        [n0, n1, mhc_mult, hidden_size] bf16

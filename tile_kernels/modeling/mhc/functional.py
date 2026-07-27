@@ -1,14 +1,16 @@
 import torch
 import torch.nn.functional as F
 
-from .ops.expand import expand_to_mhc
-from .ops.head_compute_mix import mhc_head_compute_mix
-from .ops.norm_fn import mhc_pre_norm_fn
-from .ops.post import mhc_post
-from .ops.pre_apply_mix import mhc_pre_apply_mix
-from .ops.pre_big_fuse import mhc_pre_big_fuse
-from .ops.pre_split_mixes import mhc_pre_split_mixes
-from .ops.sinkhorn import sinkhorn_normalize
+from .ops import (
+    expand_to_mhc,
+    mhc_head_compute_mix,
+    mhc_post,
+    mhc_pre_apply_mix,
+    mhc_pre_big_fuse,
+    mhc_pre_norm_fn,
+    mhc_pre_split_mixes,
+    sinkhorn_normalize,
+)
 
 
 def expand_from_embedding(x: torch.Tensor, mhc_mult: int = 4) -> torch.Tensor:

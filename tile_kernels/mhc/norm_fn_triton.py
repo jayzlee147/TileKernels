@@ -1,4 +1,4 @@
-"""Triton-fused mhc_pre_norm_fn FWD + BWD for TileKernels.
+"""Triton + rocBLAS hybrid mhc_pre_norm_fn FWD + BWD for TileKernels.
 
 Math (FWD):
     For each token (row of residual) of length total_hidden = n_rms_group * rms_group_size:
@@ -21,13 +21,17 @@ Math (BWD):
     inv_rms and dot are recomputed in the BWD kernel to save memory.
     d_fn cross-token reduction is done on the host via torch.einsum.
 
-This is a fused RMSNorm + small GEMM, replacing the tilelang multi-kernel
-approach (normw_merge, fwd_mul, fwd_norm) with a single Triton kernel.
+Hybrid approach (default):
+    The GEMV (x @ fn.T) is offloaded to torch.mm (backed by rocBLAS), which is
+    ~8x faster than the per-token elementwise dot product in Triton for
+    tall-skinny shapes like (4096, 16384) @ (16384, 24).  RMSNorm is computed
+    via PyTorch ops.  The fully-fused Triton kernels are kept as fallback.
 """
 
 from __future__ import annotations
 
 import math
+import weakref
 
 import torch
 import triton
@@ -267,6 +271,26 @@ def _pick_h_blk(rms_group_size: int, default: int = 512) -> int:
     return math.gcd(rms_group_size, default)
 
 
+# ---------------------------------------------------------------------------
+# fn transpose cache — avoids repeated .T.contiguous() allocations
+# ---------------------------------------------------------------------------
+
+_fn_transpose_cache: dict[int, tuple[weakref.ref, torch.Tensor]] = {}
+
+
+def _get_fn_transpose(fn: torch.Tensor) -> torch.Tensor:
+    """Return fn.T.contiguous(), caching the result keyed on data_ptr."""
+    key = fn.data_ptr()
+    cached = _fn_transpose_cache.get(key)
+    if cached is not None:
+        ref, fn_t = cached
+        if ref() is fn:
+            return fn_t
+    fn_t = fn.T.contiguous()
+    _fn_transpose_cache[key] = (weakref.ref(fn), fn_t)
+    return fn_t
+
+
 def norm_fn_fwd_triton(
     x: torch.Tensor,           # [num_tokens, total_hidden] bf16, contiguous
     fn: torch.Tensor,          # [mhc_mult3, total_hidden]  fp32, contiguous
@@ -275,30 +299,65 @@ def norm_fn_fwd_triton(
     rms_group_size: int,
     eps: float,
     out: torch.Tensor | None = None,
+    use_fused_triton: bool = False,
 ) -> torch.Tensor:
-    """Launch the FWD Triton kernel for mhc_pre_norm_fn."""
+    """FWD wrapper for mhc_pre_norm_fn.
+
+    By default uses a hybrid approach: torch.mm for the GEMV (backed by
+    rocBLAS) and PyTorch ops for RMSNorm.  Set *use_fused_triton=True* to
+    fall back to the fully-fused Triton kernel.
+    """
     num_tokens = x.shape[0]
     total_hidden = x.shape[1]
 
-    if out is None:
-        out = torch.empty((num_tokens, mhc_mult3), dtype=torch.float32, device=x.device)
+    if use_fused_triton:
+        # --- Fully-fused Triton fallback ---
+        if out is None:
+            out = torch.empty((num_tokens, mhc_mult3), dtype=torch.float32, device=x.device)
 
-    H_BLK = _pick_h_blk(rms_group_size)
-    K_BLK = _next_power_of_2(mhc_mult3)
+        H_BLK = _pick_h_blk(rms_group_size)
+        K_BLK = _next_power_of_2(mhc_mult3)
 
-    grid = (num_tokens,)
+        grid = (num_tokens,)
 
-    _norm_fn_fwd_kernel_vec[grid](
-        x, fn, out,
-        num_tokens, total_hidden,
-        MHC_MULT3=mhc_mult3,
-        RMS_GROUP_SIZE=rms_group_size,
-        N_RMS_GROUP=n_rms_group,
-        H_BLK=H_BLK,
-        K_BLK=K_BLK,
-        EPS=eps,
-    )
-    return out
+        _norm_fn_fwd_kernel_vec[grid](
+            x, fn, out,
+            num_tokens, total_hidden,
+            MHC_MULT3=mhc_mult3,
+            RMS_GROUP_SIZE=rms_group_size,
+            N_RMS_GROUP=n_rms_group,
+            H_BLK=H_BLK,
+            K_BLK=K_BLK,
+            EPS=eps,
+        )
+        return out
+
+    # --- Hybrid: torch.mm GEMV + PyTorch RMSNorm ---
+    x_f32 = x.float()  # [num_tokens, total_hidden]
+
+    # Per-group inv_rms: [num_tokens, n_rms_group]
+    x_grouped = x_f32.view(num_tokens, n_rms_group, rms_group_size)
+    inv_rms = torch.rsqrt(
+        x_grouped.square().sum(-1) / rms_group_size + eps,
+    )  # [num_tokens, n_rms_group]
+
+    if n_rms_group == 1:
+        # Fast path: single group — GEMV via rocBLAS + scalar inv_rms
+        fn_t = _get_fn_transpose(fn)
+        dot = torch.mm(x_f32, fn_t)  # [num_tokens, mhc_mult3]
+        result = dot * inv_rms  # inv_rms is [num_tokens, 1], broadcasts
+    else:
+        # Multi-group: per-group dot products needed, use einsum
+        fn_grouped = fn.view(mhc_mult3, n_rms_group, rms_group_size)
+        dot_grouped = torch.einsum(
+            'ngs,kgs->ngk', x_grouped, fn_grouped,
+        )  # [num_tokens, n_rms_group, mhc_mult3]
+        result = (dot_grouped * inv_rms.unsqueeze(-1)).sum(1)  # [num_tokens, mhc_mult3]
+
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 
 def norm_fn_bwd_triton(
@@ -309,8 +368,12 @@ def norm_fn_bwd_triton(
     n_rms_group: int,
     rms_group_size: int,
     eps: float,
+    use_fused_triton: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch the BWD Triton kernel for d_x and compute d_fn on host.
+    """BWD wrapper for d_x and d_fn.
+
+    By default uses a hybrid approach with torch.mm for GEMVs.  Set
+    *use_fused_triton=True* to use the Triton kernel for d_x.
 
     Returns:
         d_x:  [num_tokens, total_hidden] fp32
@@ -319,37 +382,66 @@ def norm_fn_bwd_triton(
     num_tokens = x.shape[0]
     total_hidden = x.shape[1]
 
-    d_x = torch.empty((num_tokens, total_hidden), dtype=torch.float32, device=x.device)
-
-    H_BLK = _pick_h_blk(rms_group_size)
-    K_BLK = _next_power_of_2(mhc_mult3)
-
-    grid = (num_tokens, n_rms_group)
-
-    _norm_fn_bwd_kernel[grid](
-        d_out, x, fn,
-        d_x,
-        num_tokens, total_hidden,
-        MHC_MULT3=mhc_mult3,
-        RMS_GROUP_SIZE=rms_group_size,
-        N_RMS_GROUP=n_rms_group,
-        H_BLK=H_BLK,
-        K_BLK=K_BLK,
-        EPS=eps,
-    )
-
-    # d_fn[k, h] = sum_n(d_out[n, k] * x_normed[n, h])
-    # where x_normed[n, h] = x[n, h] * inv_rms[n, g(h)] and g(h) = h // rms_group_size
-    # Recompute x_normed on the host to avoid storing it
-    x_f = x.float()  # [num_tokens, total_hidden]
-    # Compute per-group inv_rms: [num_tokens, n_rms_group]
-    x_grouped = x_f.view(num_tokens, n_rms_group, rms_group_size)
-    sqrsum = (x_grouped * x_grouped).sum(-1)  # [num_tokens, n_rms_group]
+    # --- Recompute inv_rms (needed by both paths) ---
+    x_f32 = x.float()  # [num_tokens, total_hidden]
+    x_grouped = x_f32.view(num_tokens, n_rms_group, rms_group_size)
+    sqrsum = x_grouped.square().sum(-1)  # [num_tokens, n_rms_group]
     inv_rms = torch.rsqrt(sqrsum / rms_group_size + eps)  # [num_tokens, n_rms_group]
-    # x_normed[n, g, h] = x[n, g, h] * inv_rms[n, g]
+
+    if use_fused_triton:
+        # --- Fully-fused Triton fallback for d_x ---
+        d_x = torch.empty((num_tokens, total_hidden), dtype=torch.float32, device=x.device)
+
+        H_BLK = _pick_h_blk(rms_group_size)
+        K_BLK = _next_power_of_2(mhc_mult3)
+
+        grid = (num_tokens, n_rms_group)
+
+        _norm_fn_bwd_kernel[grid](
+            d_out, x, fn,
+            d_x,
+            num_tokens, total_hidden,
+            MHC_MULT3=mhc_mult3,
+            RMS_GROUP_SIZE=rms_group_size,
+            N_RMS_GROUP=n_rms_group,
+            H_BLK=H_BLK,
+            K_BLK=K_BLK,
+            EPS=eps,
+        )
+    else:
+        # --- Hybrid: torch.mm for d_x ---
+        # d_x_g[h] = inv_rms_g * (sum_k(d_out[k] * fn[k, g*S+h])
+        #            - x_g[h] * inv_rms_g^2 * c_g / S)
+        # where c_g = sum_k(d_out[k] * dot_g[k])
+        #       dot_g[k] = sum_h(x_g[h] * fn[k, g*S+h])
+
+        # Recompute dot_grouped for multi-group c_g
+        fn_grouped = fn.view(mhc_mult3, n_rms_group, rms_group_size)
+        dot_grouped = torch.einsum(
+            'ngs,kgs->ngk', x_grouped, fn_grouped,
+        )  # [num_tokens, n_rms_group, mhc_mult3]
+
+        # c_g = sum_k(d_out[k] * dot_g[k])  — [num_tokens, n_rms_group]
+        c_g = torch.einsum(
+            'nk,ngk->ng', d_out, dot_grouped,
+        )  # [num_tokens, n_rms_group]
+
+        # sum_k(d_out[k] * fn[k, h]) via GEMV: [num_tokens, total_hidden]
+        dout_fn = torch.mm(d_out, fn)  # [num_tokens, total_hidden]
+        dout_fn_grouped = dout_fn.view(num_tokens, n_rms_group, rms_group_size)
+
+        # rms_coeff[n, g] = -inv_rms^3 * c_g / S
+        rms_coeff = -inv_rms.pow(3) * c_g / rms_group_size  # [num_tokens, n_rms_group]
+
+        # d_x[n, g, h] = inv_rms[n,g] * dout_fn[n,g,h] + rms_coeff[n,g] * x[n,g,h]
+        d_x = (
+            inv_rms.unsqueeze(-1) * dout_fn_grouped
+            + rms_coeff.unsqueeze(-1) * x_grouped
+        ).view(num_tokens, total_hidden)
+
+    # --- d_fn (same for both paths): d_fn = d_out^T @ x_normed ---
     x_normed = (x_grouped * inv_rms.unsqueeze(-1)).view(num_tokens, total_hidden)
-    # d_fn = d_out^T @ x_normed: [mhc_mult3, total_hidden]
-    d_fn = d_out.t() @ x_normed
+    d_fn = torch.mm(d_out.t(), x_normed)  # [mhc_mult3, total_hidden]
 
     return d_x, d_fn
 
@@ -360,7 +452,7 @@ def norm_fn_bwd_triton(
 
 
 class MhcPreNormFnTritonFn(torch.autograd.Function):
-    """Autograd wrapper for Triton mhc_pre_norm_fn FWD."""
+    """Autograd wrapper for hybrid mhc_pre_norm_fn FWD + BWD."""
 
     @staticmethod
     def forward(

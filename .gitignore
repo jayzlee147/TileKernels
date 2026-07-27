@@ -19,3 +19,11 @@ _version.py
 # workspace
 workspace
 .rocprofv3\nref/\ntest_modified_kernel.py\ntests/mhc/_check_*.py\ntune_*_results.csv
+.rocprofv3/
+ref/
+test_modified_kernel.py
+tests/mhc/_check_*.py
+tests/mhc/_ttgir_*.py
+tests/mhc/_bench_*.py
+tests/mhc/_norm_fn_*.py
+tune_*_results.csv

@@ -189,7 +189,7 @@ if __name__ == '__main__':
             fwd_mul_k = _mhc_pre_norm_fn_fwd_mul(24, n_rms, rgs)
             N_t = 64
             x_t = torch.randn(N_t, n_rms * rgs, dtype=torch.bfloat16, device='cuda')
-            fn_t2 = torch.randn(24, n_rms * rgs, dtype=torch.float32, device='cuda')
+            fn_t2 = torch.randn(24, n_rms * rgs, dtype=torch.bfloat16, device='cuda')
             out_t = torch.empty(N_t, n_rms, 24, dtype=torch.float32, device='cuda')
             sq_t = torch.empty(N_t, n_rms, dtype=torch.float32, device='cuda')
             fwd_mul_k(x_t, fn_t2, out_t, sq_t)

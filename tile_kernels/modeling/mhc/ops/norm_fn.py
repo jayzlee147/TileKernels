@@ -8,7 +8,6 @@ from tile_kernels.mhc.norm_fn_kernel import (
     _mhc_pre_norm_fn_bwd_norm,
     _mhc_pre_norm_fn_fwd_mul,
     _mhc_pre_norm_fn_fwd_norm,
-    round_to_tf32,
 )
 
 
@@ -90,12 +89,12 @@ class MHCPreNormFn(torch.autograd.Function):
         out_mul_splitted = out_mul_splitted[:1]
         sqrsum_splitted = sqrsum_splitted[:1]
 
-        fn = round_to_tf32(fn)
+        fn_bf16 = fn.bfloat16()
 
         fwd_mul_kernel = _mhc_pre_norm_fn_fwd_mul(mhc_mult3, 1, mhc_hidden_size)
         fwd_mul_kernel(
             x.view(-1, mhc_hidden_size),
-            fn,
+            fn_bf16,
             out_mul_splitted.view(-1, 1, mhc_mult3),
             sqrsum_splitted.view(-1, 1),
         )
@@ -152,14 +151,12 @@ class MHCPreNormFn(torch.autograd.Function):
             x_grad = torch.zeros_like(x)
         fn_grad = torch.empty_like(fn)
 
-        out_mul_grad = round_to_tf32(out_mul_grad)
-
         bwd_mul_kernel = _mhc_pre_norm_fn_bwd_mul(mhc_mult3, 1, mhc_hidden_size)
         bwd_mul_kernel(
             out_mul_grad.view(-1, 1, mhc_mult3),
             sqrsum_grad.view(-1, 1),
             x.view(-1, mhc_hidden_size),
-            fn,
+            fn.bfloat16(),
             x_grad.view(-1, mhc_hidden_size),
             fn_grad,
         )

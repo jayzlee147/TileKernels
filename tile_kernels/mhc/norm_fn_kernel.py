@@ -65,48 +65,40 @@ def _mhc_fn_normw_merge_bwd(m: int, n: int, dtype: T.dtype = T.float32) -> tilel
 
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
-def _mhc_pre_norm_fn_fwd_mul(
+def _mhc_pre_norm_fn_fwd_gemm(
     mhc_mult3: int,
     n_rms_group: int,
     rms_group_size: int,
     token_block: int = 32,
     hidden_block: int = 256,
-    num_stages: int = 0 if _IS_HIP else 2,
+    num_stages: int = 2,
 ) -> tilelang.JITKernel:
+    """bf16 MFMA GEMM kernel: computes x @ fn^T only (no sqrsum)."""
     assert mhc_mult3 <= 32
     num_tokens = T.dynamic('num_tokens')
     assert rms_group_size % hidden_block == 0
 
     @T.prim_func
-    def _mhc_pre_norm_fn_fwd_mul_kernel(
+    def _kernel(
         x: T.Tensor[(num_tokens, n_rms_group * rms_group_size), T.bfloat16],
-        fn: T.Tensor[(mhc_mult3, n_rms_group * rms_group_size), T.float32],
+        fn: T.Tensor[(mhc_mult3, n_rms_group * rms_group_size), T.bfloat16],
         out: T.Tensor[(num_tokens, n_rms_group, mhc_mult3), T.float32],
-        sqrsum: T.Tensor[(num_tokens, n_rms_group), T.float32],
     ) -> None:
         _ = mhc_mult3
         with T.Kernel(T.ceildiv(num_tokens, token_block), n_rms_group) as (pid_x, pid_y):
             out_frag = T.alloc_fragment((token_block, 32), T.float32)
-            sqrsum_part = T.alloc_fragment((token_block, 4), T.float32)
             T.clear(out_frag)
-            T.clear(sqrsum_part)
             for pz in T.Pipelined(rms_group_size // hidden_block, num_stages=num_stages):
-                x_smem_16 = T.alloc_shared((token_block, hidden_block), T.bfloat16)
-                fn_smem = T.alloc_shared((32, hidden_block), T.float32)
+                x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
+                fn_smem = T.alloc_shared((32, hidden_block), T.bfloat16)
 
-                T.annotate_layout({x_smem_16: tilelang.layout.make_swizzled_layout(x_smem_16)})
+                T.annotate_layout({x_smem: tilelang.layout.make_swizzled_layout(x_smem)})
 
-                T.copy(x[pid_x * token_block, pid_y * rms_group_size + pz * hidden_block], x_smem_16)
+                T.copy(x[pid_x * token_block, pid_y * rms_group_size + pz * hidden_block], x_smem)
                 T.copy(fn[0, pid_y * rms_group_size + pz * hidden_block], fn_smem)
 
-                x_frag_16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
-                T.copy(x_smem_16, x_frag_16)
-                x_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
-                T.copy(x_frag_16, x_frag)
-
-                for jj in T.serial(hidden_block // 4):
-                    for i, j in T.Parallel(token_block, 4):
-                        sqrsum_part[i, j] += x_frag[i, jj * 4 + j] * x_frag[i, jj * 4 + j]
+                x_frag = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
+                T.copy(x_smem, x_frag)
 
                 T.gemm(
                     x_frag,
@@ -116,15 +108,69 @@ def _mhc_pre_norm_fn_fwd_mul(
                     transpose_B=True,
                     clear_accum=False,
                 )
-            sqrsum_l = T.alloc_fragment(token_block, T.float32)
-            T.reduce_sum(sqrsum_part, sqrsum_l)
-            for i in T.Parallel(token_block):
-                sqrsum[pid_x * token_block + i, pid_y] = sqrsum_l[i]
             for i, j in T.Parallel(token_block, 32):
-                if j < 24:
+                if j < mhc_mult3:
                     out[pid_x * token_block + i, pid_y, j] = out_frag[i, j]
 
-    return _mhc_pre_norm_fn_fwd_mul_kernel
+    return _kernel
+
+
+@tilelang.jit
+def _mhc_pre_norm_fn_fwd_sqrsum(
+    n_rms_group: int,
+    rms_group_size: int,
+    n_thr: int = _WAVEFRONT_SIZE,
+) -> tilelang.JITKernel:
+    """Compute squared sum of x for RMSNorm (f32 precision).
+
+    One program per (token, rms_group). Each thread accumulates over
+    a strided portion of the hidden dimension.
+    """
+    num_tokens = T.dynamic('num_tokens')
+
+    @T.prim_func
+    def _kernel(
+        x: T.Tensor[(num_tokens, n_rms_group * rms_group_size), T.bfloat16],
+        sqrsum: T.Tensor[(num_tokens, n_rms_group), T.float32],
+    ) -> None:
+        with T.Kernel(num_tokens, n_rms_group, threads=n_thr) as (pid_n, pid_g):
+            acc = T.alloc_reducer(1, T.float32, replication='all')
+            T.clear(acc)
+            for h in T.Parallel(rms_group_size):
+                val = T.cast(x[pid_n, pid_g * rms_group_size + h], T.float32)
+                acc[0] += val * val
+            T.finalize_reducer(acc)
+            if T.get_thread_binding() == 0:
+                sqrsum[pid_n, pid_g] = acc[0]
+
+    return _kernel
+
+
+def _mhc_pre_norm_fn_fwd_mul(
+    mhc_mult3: int,
+    n_rms_group: int,
+    rms_group_size: int,
+    token_block: int = 32,
+    hidden_block: int = 256,
+    num_stages: int = 2,
+):
+    """Returns a callable that runs both GEMM and sqrsum kernels.
+
+    Maintains the same interface as the original fused kernel.
+    """
+    gemm_kernel = _mhc_pre_norm_fn_fwd_gemm(
+        mhc_mult3, n_rms_group, rms_group_size,
+        token_block, hidden_block, num_stages,
+    )
+    sqrsum_kernel = _mhc_pre_norm_fn_fwd_sqrsum(
+        n_rms_group, rms_group_size,
+    )
+
+    def _run(x, fn, out, sqrsum):
+        gemm_kernel(x, fn, out)
+        sqrsum_kernel(x, sqrsum)
+
+    return _run
 
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
@@ -228,7 +274,7 @@ def _mhc_pre_norm_fn_bwd_mul(
         sqrsum_grad: T.Tensor[(num_tokens, n_rms_group), T.float32],
         # Saved inputs
         x: T.Tensor[(num_tokens, n_rms_group * rms_group_size), T.bfloat16],
-        fn: T.Tensor[(mhc_mult3, n_rms_group * rms_group_size), T.float32],
+        fn: T.Tensor[(mhc_mult3, n_rms_group * rms_group_size), T.bfloat16],
         # Computed gradient of inputs
         x_grad: T.Tensor[(num_tokens, n_rms_group * rms_group_size), T.bfloat16],
         fn_grad: T.Tensor[(mhc_mult3, n_rms_group * rms_group_size), T.float32],
@@ -236,30 +282,34 @@ def _mhc_pre_norm_fn_bwd_mul(
         with T.Kernel(n_rms_group, T.ceildiv(rms_group_size, hidden_block)) as (pid_y, pid_z):
             yz = pid_y * rms_group_size + pid_z * hidden_block
 
-            fn_smem = T.alloc_shared((32, hidden_block), T.float32)
+            # Load fn as bf16 into shared memory for bf16 MFMA
+            fn_smem = T.alloc_shared((32, hidden_block), T.bfloat16)
             for i, j in T.Parallel(32, hidden_block):
                 if i < mhc_mult3:
                     fn_smem[i, j] = fn[i, yz + j]
                 else:
-                    fn_smem[i, j] = 0
+                    fn_smem[i, j] = T.cast(0, T.bfloat16)
 
             fn_grad_frag = T.alloc_fragment((32, hidden_block), T.float32)
             T.fill(fn_grad_frag, 0)
 
             for px in T.serial(T.ceildiv(num_tokens, token_block)):
-                x_smem = T.alloc_shared((token_block, hidden_block), T.float32)
+                # Load x as bf16 into shared memory
+                x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
                 T.copy(x[px * token_block, yz], x_smem)
 
-                padded_grad = T.alloc_shared((token_block, 32), T.float32)
+                # Load gradient as bf16 for MFMA
+                padded_grad = T.alloc_shared((token_block, 32), T.bfloat16)
                 for i, j in T.Parallel(token_block, 32):
                     if j < mhc_mult3:
-                        padded_grad[i, j] = out_mul_grad[px * token_block + i, pid_y, j]
+                        padded_grad[i, j] = T.cast(out_mul_grad[px * token_block + i, pid_y, j], T.bfloat16)
                     else:
-                        padded_grad[i, j] = 0
+                        padded_grad[i, j] = T.cast(0, T.bfloat16)
 
                 x_grad_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
                 T.copy(x_grad[px * token_block, yz], x_grad_frag)
 
+                # bf16 MFMA: padded_grad^T @ x_smem → fn_grad_frag (f32 accum)
                 T.gemm(
                     padded_grad,
                     x_smem,
@@ -268,6 +318,7 @@ def _mhc_pre_norm_fn_bwd_mul(
                     transpose_B=False,
                     clear_accum=False,
                 )
+                # bf16 MFMA: padded_grad @ fn_smem → x_grad_frag (f32 accum)
                 T.gemm(
                     padded_grad,
                     fn_smem,
@@ -277,10 +328,13 @@ def _mhc_pre_norm_fn_bwd_mul(
                     clear_accum=False,
                 )
 
+                # sqrsum_grad contribution (needs f32 x)
+                x_smem_f32 = T.alloc_fragment((token_block, hidden_block), T.float32)
+                T.copy(x_smem, x_smem_f32)
                 sqrsum_grad_frag = T.alloc_fragment((token_block, 1), T.float32)
                 T.copy(sqrsum_grad[px * token_block, pid_y], sqrsum_grad_frag)
                 for i, j in T.Parallel(token_block, hidden_block):
-                    x_grad_frag[i, j] += 2 * x_smem[i, j] * sqrsum_grad_frag[i, 0]
+                    x_grad_frag[i, j] += 2 * x_smem_f32[i, j] * sqrsum_grad_frag[i, 0]
 
                 T.copy(x_grad_frag, x_grad[px * token_block, yz])
 

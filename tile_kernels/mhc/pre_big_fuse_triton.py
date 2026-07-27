@@ -368,7 +368,7 @@ def mhc_pre_big_fuse_triton(
         comb_mix:    [*, mhc_mult, mhc_mult]    fp32
         layer_input: [*, hidden_size]            bf16
     """
-    from tile_kernels.mhc.norm_fn_kernel import _mhc_pre_norm_fn_fwd_mul, round_to_tf32
+    from tile_kernels.mhc.norm_fn_kernel import _mhc_pre_norm_fn_fwd_mul
 
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
@@ -395,11 +395,11 @@ def mhc_pre_big_fuse_triton(
         dtype=torch.float32, device=residual.device,
     )
 
-    fn_tf32 = round_to_tf32(fn)
+    fn_bf16 = fn.bfloat16()
     fwd_mul_kernel = _mhc_pre_norm_fn_fwd_mul(mhc_mult3, 1, mhc_hidden_size)
     fwd_mul_kernel(
         residual_flat.reshape(-1, mhc_hidden_size),
-        fn_tf32,
+        fn_bf16,
         gemm_out_mul.reshape(-1, 1, mhc_mult3),
         gemm_out_sqrsum.reshape(-1, 1),
     )

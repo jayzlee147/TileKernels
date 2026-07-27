@@ -132,3 +132,29 @@ else:
     from .pre_big_fuse import mhc_pre_big_fuse
     from .pre_split_mixes import mhc_pre_split_mixes
     from .sinkhorn import sinkhorn_normalize
+
+
+# --- Fused split + sinkhorn (triton only, for mhc_pre pipeline) ---
+def mhc_pre_split_mixes_and_sinkhorn(
+    input_mixes, mhc_scale, mhc_base,
+    mhc_mult, mhc_post_mult_value, mhc_pre_eps,
+    sinkhorn_repeat=10, sinkhorn_eps=1e-6,
+):
+    """Fused pre_split_mixes + sinkhorn when triton backend is active."""
+    if use_triton():
+        from tile_kernels.mhc.hc_fused_triton import hc_fused_triton
+        return hc_fused_triton(
+            input_mixes, mhc_scale, mhc_base,
+            mhc_mult=mhc_mult,
+            mhc_post_mult_value=mhc_post_mult_value,
+            mhc_pre_eps=mhc_pre_eps,
+            sinkhorn_repeat=sinkhorn_repeat,
+            sinkhorn_eps=sinkhorn_eps,
+        )
+    else:
+        pre, post, comb = mhc_pre_split_mixes(
+            input_mixes, mhc_scale, mhc_base,
+            mhc_mult, mhc_post_mult_value, mhc_pre_eps,
+        )
+        comb = sinkhorn_normalize(comb, repeat=sinkhorn_repeat, eps=sinkhorn_eps)
+        return pre, post, comb

@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from .ops import (
+    mhc_pre_split_mixes_and_sinkhorn,
     expand_to_mhc,
     mhc_head_compute_mix,
     mhc_post,
@@ -91,16 +92,16 @@ def mhc_pre(
         n_splits=n_splits,
     )
 
-    pre_mix, post_mix, comb_mix = mhc_pre_split_mixes(
+    pre_mix, post_mix, comb_mix = mhc_pre_split_mixes_and_sinkhorn(
         mixes,
         scale,
         base,
         mhc_mult,
         post_mult_value,
         pre_eps,
+        sinkhorn_repeat=sinkhorn_repeat,
+        sinkhorn_eps=sinkhorn_eps,
     )
-
-    comb_mix = sinkhorn_normalize(comb_mix, repeat=sinkhorn_repeat, eps=sinkhorn_eps)
 
     layer_input = mhc_pre_apply_mix(residual, pre_mix)
 
